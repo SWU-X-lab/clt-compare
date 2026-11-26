@@ -75,7 +75,7 @@ const SESSION_ID = (globalThis.crypto && typeof globalThis.crypto.randomUUID ===
 
 // 运行版本标记（与 exp1_clt.html 中 exp1_clt.js?v= 保持一致）：
 // 用于确认浏览器实际加载的是最新代码，而非缓存里的旧版本
-const EXP1_CLT_BUILD = '20261125compare-clean2';
+const EXP1_CLT_BUILD = '20261126-data-integrity1';
 console.log('[exp1_clt] build ' + EXP1_CLT_BUILD + ' loaded');
 
 // 页面版本核对：与 html 的 PAGE_BUILD 不一致时告警
@@ -95,6 +95,8 @@ console.log('[exp1_clt] build ' + EXP1_CLT_BUILD + ' loaded');
 })();
 
 const storage = window.CLTStorage;
+let sessionInterrupted = false;
+let storageReady = false;
 let p = {};
 let stimData = [];
 let practiceData = [];
@@ -208,6 +210,12 @@ function generateSubjectID(subGroupValue) {
     return `${subGroupValue}_${order}_${suffix}`;
 }
 
+function seedFromSubjectID(subjectID) {
+    let hash = 2166136261;
+    for (const ch of String(subjectID)) hash = Math.imul(hash ^ ch.charCodeAt(0), 16777619);
+    return (hash >>> 0) || 1;
+}
+
 function formatDateYYYYMMDD(d) {
     const y = d.getFullYear();
     const m = String(d.getMonth() + 1).padStart(2, '0');
@@ -264,7 +272,13 @@ document.getElementById('start-btn').addEventListener('click', async () => {
     }
     p.subGroup = Number(subGroupValue);
 
-    const subjectID = generateSubjectID(p.subGroup);
+    // 需要跨任务配对时由主试分配同一个匿名码；留空仍自动生成。
+    const participantCode = document.getElementById('participantCode').value.trim();
+    if (p.subGroup !== 0 && participantCode && !/^[A-Za-z0-9][A-Za-z0-9_-]{5,63}$/.test(participantCode)) {
+        showSetupError('匿名被试码须为 6–64 位字母、数字、下划线或连字符，且以字母或数字开头。');
+        return;
+    }
+    const subjectID = p.subGroup !== 0 && participantCode ? participantCode : generateSubjectID(p.subGroup);
     subjectIDInput.value = subjectID;
     p.subjectID = subjectID;
 
@@ -280,7 +294,7 @@ document.getElementById('start-btn').addEventListener('click', async () => {
     p.expDate = formatDateYYYYMMDD(new Date());
 
     // 调试模式固定种子，正式模式用被试编号派生
-    p.rndSeed = p.debugMode ? 1111 : Number(subjectID) || Date.now();
+    p.rndSeed = p.debugMode ? 1111 : seedFromSubjectID(subjectID);
     seedRandom(p.rndSeed);
 
     runtimeNumBlocks = prefs.numBlocks;
@@ -345,10 +359,12 @@ document.getElementById('start-btn').addEventListener('click', async () => {
     }
 
     try {
-        if (!storage) throw new Error('Storage adapter is unavailable');
-        await storage.initializeStorage({
-            participant: { ...p }, build: EXP1_CLT_BUILD, experiment: EXPERIMENT_NAME
-        });
+        if (!p.debugMode && storage) {
+            await storage.initializeStorage({
+                participant: { ...p }, build: EXP1_CLT_BUILD, experiment: EXPERIMENT_NAME
+            });
+            storageReady = true;
+        }
     } catch (err) {
         console.error('[CLT storage] initialization failed:', err);
         if (storage && storage.backendName === 'jatos') {
@@ -359,7 +375,7 @@ document.getElementById('start-btn').addEventListener('click', async () => {
 
     let resumable = null;
     try {
-        resumable = await storage.loadProgress();
+        if (storageReady) resumable = await storage.loadProgress();
     } catch (err) {
         console.warn('[' + EXPERIMENT_NAME + '] 读取续做进度失败，将从头开始：', err);
     }
@@ -375,7 +391,7 @@ document.getElementById('start-btn').addEventListener('click', async () => {
     // 被试编号确认页：让被试看清并记录编号
     const confirmIdEl = document.getElementById('confirm-subject-id');
     if (confirmIdEl) confirmIdEl.innerText = '被试编号：' + p.subjectID;
-    switchScreen('subjectid-confirm');
+    switchScreen('subjectid_confirm');
     experimentPhase = 'subjectid_confirm';
 });
 
@@ -529,9 +545,10 @@ window.addEventListener('beforeunload', (e) => {
     return e.returnValue;
 });
 
-// (6) 页面失焦 / 切到后台：给出告警，但**不**清空数据、不终止试次
+// (6) 页面切到后台 / 失焦：终止受干扰的试次并单独记录
 let visibilityWarned = false;
 document.addEventListener('visibilitychange', () => {
+    if (document.hidden) interruptSession('visibility_hidden');
     if (document.hidden && !visibilityWarned) {
         visibilityWarned = true;
         console.warn('[' + EXPERIMENT_NAME + '] 页面失焦：被试切到其他窗口 / 标签页。');
@@ -540,6 +557,7 @@ document.addEventListener('visibilitychange', () => {
     }
 });
 window.addEventListener('blur', () => {
+    interruptSession('window_blur');
     if (experimentPhase === 'trial_response' || experimentPhase === 'practice_response') {
         console.warn('[' + EXPERIMENT_NAME + '] 实验进行中窗口失焦，请保持页面在前台。');
     }
@@ -764,6 +782,7 @@ function drawPlanSquares(plan, colorIdxArr) {
 }
 
 async function runPracticeTrial() {
+    if (sessionInterrupted) return;
     if (practiceTrialIdx >= practiceTrials.length) {
         endPractice();
         return;
@@ -784,7 +803,7 @@ async function runPracticeTrial() {
     drawBackground(); drawFixation();
     await wait(prefs.ITI);
 
-    await showStudyArrayPractice(condition);
+    if (!sessionInterrupted) await showStudyArrayPractice(condition);
 }
 
 async function showStudyArrayPractice(condition) {
@@ -799,6 +818,7 @@ async function showStudyArrayPractice(condition) {
     drawPlanSquares(plan, plan.memColors);
     const studyStartTime = performance.now();
     await wait(condition.studyDuration);
+    if (sessionInterrupted) return;
     practiceTrialData.studyDurationActual = (performance.now() - studyStartTime).toFixed(2);
 
     // 保留间隔（注视点全程固定显示，不消失）
@@ -806,7 +826,7 @@ async function showStudyArrayPractice(condition) {
     await wait(prefs.retentionInterval);
 
     // 探测阵列：直接用同一个 plan 的 probeColors，任何情况下都只有一个方块变色
-    showTestArrayPractice(plan);
+    if (!sessionInterrupted) showTestArrayPractice(plan);
 }
 
 function showTestArrayPractice(plan) {
@@ -967,6 +987,7 @@ function startBlock() {
 }
 
 async function runTrial() {
+    if (sessionInterrupted) return;
     if (currentTrial >= blockTrials.length) {
         endBlock();
         return;
@@ -981,6 +1002,7 @@ async function runTrial() {
         sessionID: SESSION_ID,
         block: currentBlock,
         trial: currentTrial + 1,
+        TrialGlobal: formalTrialGlobalIdx + 1,
         setSize: condition.setSize,
         studyDuration: condition.studyDuration,
         isChange: 1,
@@ -991,7 +1013,7 @@ async function runTrial() {
     drawBackground(); drawFixation();
     await wait(prefs.ITI);
 
-    await showStudyArray(condition);
+    if (!sessionInterrupted) await showStudyArray(condition);
 }
 
 async function showStudyArray(condition) {
@@ -1009,12 +1031,14 @@ async function showStudyArray(condition) {
     drawPlanSquares(plan, plan.memColors);
     const studyStartTime = performance.now();
     await wait(condition.studyDuration);
+    if (sessionInterrupted) return;
     trialData.studyDurationActual = (performance.now() - studyStartTime).toFixed(2);
 
     // 保留间隔（注视点全程固定显示，不消失）
     drawBackground(); drawFixation();
     await wait(prefs.retentionInterval);
 
+    if (sessionInterrupted) return;
     trialData.changeItem = plan.changeIdx;
     trialData.origColorIdx = plan.origColor;
     trialData.probeColorIdx = plan.newColor;
@@ -1074,10 +1098,11 @@ function recordResponse(responseNum) {
     //       "漏填"而与真正的缺失混淆，因此额外写一个显式状态列做区分标记。
     trialData.TrialStatus = timedOut ? 'timeout' : 'valid';
     trialData.CountedInK = timedOut ? 0 : 1;
+    captureCursorData(trialData, !timedOut);
 
     const completedTrial = Object.assign({}, trialData);
     stimData.push(completedTrial);
-    if (storage) {
+    if (storageReady) {
         storage.saveTrial(prepareStorageRow(completedTrial)).catch(error => {
             console.error('[CLT storage] trial save failed:', error);
         });
@@ -1115,7 +1140,7 @@ function computeLowAccuracyFlag() {
     const details = [];
     for (const ss of [3, 4]) {
         const rows = stimData.filter(
-            d => d.setSize === ss && Number(d.studyDuration) >= LOW_ACC_MIN_DURATION_MS
+            d => d.setSize === ss && d.TrialStatus !== 'interrupted' && Number(d.studyDuration) >= LOW_ACC_MIN_DURATION_MS
         );
         const n = rows.length;
         const accPct = n > 0 ? rows.reduce((s, d) => s + d.accuracy, 0) / n * 100 : 0;
@@ -1137,7 +1162,7 @@ function endBlock() {
     // 无论正确率高低，实验都完整跑完预定 block，低正确率只在导出文件名上加 F。
     if (blockAcc < 50) lowAccBlockCount++;
 
-    if (storage) {
+    if (storageReady) {
         storage.saveCheckpoint({
             subjectID: p.subjectID,
             block: currentBlock,
@@ -1233,17 +1258,18 @@ function prepareStorageRow(row) {
 // ============================================================
 //  数据保存
 // ============================================================
-async function finishExperiment() {
+async function finishExperiment(interruptionReason = '') {
     switchScreen('upload');
     experimentPhase = 'upload';
 
-    let uploadMsg = "";
-    let uploadFailed = false;
+    let uploadMsg = interruptionReason ? "实验因浏览器中断而提前结束，请联系主试。 " : "";
+    let uploadFailed = Boolean(interruptionReason);
 
     enrichRows(stimData);
-    ss4LowAccuracyFlag = computeLowAccuracyFlag();
+    lowAccDetail = computeLowAccuracyFlag();
+    ss4LowAccuracyFlag = lowAccDetail.triggered;
 
-    if (storage && stimData.length > 0) {
+    if (storageReady && stimData.length > 0) {
         try {
             const saveResult = await storage.saveFinalResult({
                 trials: stimData,
@@ -1252,9 +1278,10 @@ async function finishExperiment() {
                 lowAccuracyBlockCount: lowAccBlockCount
             });
             uploadMsg += saveResult && saveResult.message ? saveResult.message : '数据保存成功。';
-            await storage.finishExperiment({ successful: true, message: 'CLT mouse completed' });
-            // 实验正常完成：清掉 Batch Session 里的进度，避免下次误判为"上次没做完"
-            await storage.clearProgress();
+            if (saveResult && saveResult.partial) uploadFailed = true;
+            // 异常退出不清除已完成组的断点；正常结束先清理、再结束后端会话。
+            if (!interruptionReason) await storage.clearProgress();
+            await storage.finishExperiment({ successful: !interruptionReason, message: interruptionReason || 'CLT mouse completed' });
         } catch (error) {
             console.error('[CLT storage] final save failed:', error);
             uploadFailed = true;
@@ -1265,8 +1292,11 @@ async function finishExperiment() {
                 console.error('[CLT storage] failed to close unsuccessful study:', finishError);
             }
         }
-    } else if (!storage) {
-        uploadMsg += "本版本未配置服务器上传，仅生成本地 Excel。";
+    } else if (p.debugMode) {
+        uploadMsg += "调试模式仅保存本地 Excel，不上传。";
+    } else if (!storageReady) {
+        uploadFailed = true;
+        uploadMsg += "服务器存储不可用，仅保存本地 Excel。";
     }
 
     if (p.saveLocal && stimData.length > 0) {
@@ -1285,7 +1315,7 @@ async function finishExperiment() {
     // 结束语画面保持干净：仅在异常时显示状态说明
     const statusEl = document.getElementById('finished-text');
     if (statusEl) {
-        if (uploadFailed) {
+        if (uploadFailed || p.debugMode) {
             statusEl.innerText = uploadMsg;
             statusEl.classList.remove('hidden');
         } else {
@@ -1297,6 +1327,7 @@ async function finishExperiment() {
     setTimeout(() => { switchScreen('finished'); }, 2000);
 
     try {
+        if (document.pointerLockElement === canvas && document.exitPointerLock) document.exitPointerLock();
         if (document.exitFullscreen && document.fullscreenElement) {
             document.exitFullscreen().catch(() => {});
         }
@@ -1364,6 +1395,7 @@ const EXCLUDE_TIMEOUT_FROM_K = true;
 
 function isCountedTrial(d) {
     // 缺列的历史数据（老版本导出的行）按"计入"处理，保证兼容
+    if (d.TrialStatus === 'interrupted') return false;
     if (EXCLUDE_TIMEOUT_FROM_K && (d.CountedInK === 0 || d.timeout === true)) return false;
     return true;
 }
@@ -1372,9 +1404,12 @@ function buildKRow(ss, durationLabel, rows) {
     const validRows = rows.filter(isCountedTrial);
     const nValid = validRows.length;
     const nCorrect = validRows.filter(d => d.accuracy === 1).length;
-    const accExclude = nValid > 0 ? nCorrect / nValid : 0;
+    const accExclude = nValid > 0 ? nCorrect / nValid : null;
     const nTotal = rows.length;
-    const accTimeoutError = nTotal > 0 ? nCorrect / nTotal : 0;
+    const nInterrupted = rows.filter(d => d.TrialStatus === 'interrupted').length;
+    const nTimeout = rows.filter(d => d.TrialStatus === 'timeout' || d.timeout === true).length;
+    const nEligible = nTotal - nInterrupted;
+    const accTimeoutError = nEligible > 0 ? nCorrect / nEligible : null;
 
     const correctRTs = validRows.filter(d => d.accuracy === 1 && typeof d.rt === 'number').map(d => d.rt);
     const rtMean = correctRTs.length > 0
@@ -1382,8 +1417,8 @@ function buildKRow(ss, durationLabel, rows) {
         : '';
 
     const N = ss;
-    const kExclude = N > 1 ? (accExclude * N * N - N) / (N - 1) : '';
-    const kTimeoutError = N > 1 ? (accTimeoutError * N * N - N) / (N - 1) : '';
+    const kExclude = N > 1 && accExclude !== null ? (accExclude * N * N - N) / (N - 1) : '';
+    const kTimeoutError = N > 1 && accTimeoutError !== null ? (accTimeoutError * N * N - N) / (N - 1) : '';
 
     // 低正确率标红：仅针对「set size ≤ 4 且 呈现时长 ≥ 200 ms」的明细条件行，
     // 且该 set size 在低正确率判定中确实触发了（≥200ms 试次正确率 < 50%）。
@@ -1408,12 +1443,13 @@ function buildKRow(ss, durationLabel, rows) {
         Condition: isSummary ? ('SS' + ss + '-汇总') : conditionLabel(durationLabel, ss),
         TotalTrials: nTotal,
         ValidTrials: nValid,
-        TimeoutTrials: nTotal - nValid,
-        TimeoutExclusionRate: (nTotal > 0 ? (nTotal - nValid) / nTotal : 0).toFixed(4),
+        TimeoutTrials: nTimeout,
+        InterruptedTrials: nInterrupted,
+        TimeoutExclusionRate: nEligible > 0 ? (nTimeout / nEligible).toFixed(4) : '',
         CorrectTrials: nCorrect,
-        Accuracy_Exclude: accExclude.toFixed(4),
+        Accuracy_Exclude: accExclude === null ? '' : accExclude.toFixed(4),
         K_Exclude: typeof kExclude === 'number' ? kExclude.toFixed(4) : '',
-        Accuracy_TimeoutErr: accTimeoutError.toFixed(4),
+        Accuracy_TimeoutErr: accTimeoutError === null ? '' : accTimeoutError.toFixed(4),
         K_TimeoutErr: typeof kTimeoutError === 'number' ? kTimeoutError.toFixed(4) : '',
         MeanRT: rtMean === '' ? '' : rtMean.toFixed(4),
         LowAccFlag: ss4LowAccuracyFlag ? 1 : 0,
@@ -1539,7 +1575,14 @@ const TRIAL_EXPORT_COLUMNS = [
     { header: 'ItemColors',          text: true, get: (d) => d.itemColors },
     { header: 'LabelMap',           text: true, get: (d) => d.labelMap },
     { header: 'TrialLabels',         text: true, get: (d) => d.trialLabels },
-    { header: 'LabelChars',          text: true, get: (d) => d.labelChars }
+    { header: 'LabelChars',          text: true, get: (d) => d.labelChars },
+    { header: 'ClickedItemIndex',           get: (d) => exportNum(d.clickedItemIndex) },
+    { header: 'CursorStartX',               get: (d) => exportNum(d.cursorStartX) },
+    { header: 'CursorStartY',               get: (d) => exportNum(d.cursorStartY) },
+    { header: 'CursorEndX',                 get: (d) => exportNum(d.cursorEndX) },
+    { header: 'CursorEndY',                 get: (d) => exportNum(d.cursorEndY) },
+    { header: 'CursorTravelPx',             get: (d) => exportNum(d.cursorTravelPx) },
+    { header: 'InterruptionReason', text: true, get: (d) => d.interruptionReason }
 ];
 
 // --- Sheet 2（K Values）---
@@ -1550,7 +1593,7 @@ const K_EXPORT_COLUMNS = [
     'TotalTrials', 'ValidTrials', 'TimeoutTrials', 'TimeoutExclusionRate',
     'CorrectTrials', 'Accuracy_Exclude', 'K_Exclude',
     'Accuracy_TimeoutErr', 'K_TimeoutErr', 'MeanRT',
-    'LowAccFlag', 'LowAccRed', 'LowAccBlockCount'
+    'LowAccFlag', 'LowAccRed', 'LowAccBlockCount', 'InterruptedTrials'
 ];
 const K_TEXT_COLUMNS = new Set(['SubjectID', 'ExperimentType', 'Condition']);
 
@@ -1583,7 +1626,7 @@ function downloadXLSX() {
 
     // 全局试次序号（1..360）：长格式里用来查顺序效应 / 疲劳效应，
     // 先按原始实验顺序写好，Grouped Trials 重排后仍指向同一试次
-    stimData.forEach((d, i) => { d.TrialGlobal = i + 1; });
+    // 续做或提前结束时保留原正式序号，不按本次导出的行号重新编号。
 
     // ============================================================
     //  Sheet 1: Trial Data
@@ -1620,7 +1663,7 @@ function downloadXLSX() {
     // ============================================================
     const colorAccData = [];
     for (const ss of sortedSetSizes) {
-        const ssRows = stimData.filter(d => Number(d.setSize) === ss);
+        const ssRows = stimData.filter(d => Number(d.setSize) === ss && d.TrialStatus !== 'interrupted');
         for (let c = 0; c < colors_9.length; c++) {
             const colorRows = ssRows.filter(d => Number(d.correctColorIdx) === c);
             const nTotal = colorRows.length;
@@ -1797,23 +1840,50 @@ window.addEventListener('mousemove', (e) => {
     redrawProbeScreen();
 });
 
-document.addEventListener('pointerlockchange', () => {
-    pointerLocked = document.pointerLockElement === canvas;
-    lastClientX = null; lastClientY = null;
-    if (!pointerLocked && cursorActive &&
-        (experimentPhase === 'trial_response' || experimentPhase === 'practice_response')) {
-        hideVirtualCursor();
-        alert('鼠标指针锁定已退出，当前试次已停止。请重新进入实验。');
+function captureCursorData(row, hasClick) {
+    row.clickedItemIndex = hasClick && clickedItemIndexCircle >= 0 ? clickedItemIndexCircle : null;
+    row.cursorStartX = cursorStartX;
+    row.cursorStartY = cursorStartY;
+    row.cursorEndX = hasClick ? virtualCursor.x : null;
+    row.cursorEndY = hasClick ? virtualCursor.y : null;
+    row.cursorTravelPx = hasClick ? Number(cursorTravelPx.toFixed(2)) : null;
+}
+
+function interruptSession(reason) {
+    const phase = experimentPhase;
+    const activeTrial = phase === 'trial_running' || phase === 'trial_response';
+    const activeSession = activeTrial || phase === 'trial_locked' || phase === 'practice_running' ||
+        phase === 'practice_response' || phase === 'practice_locked' || phase === 'practice_end' ||
+        phase === 'break_countdown' || phase === 'break_wait' || phase === 'instructions' || phase === 'subjectid_confirm';
+    if (!activeSession || sessionInterrupted) return;
+
+    sessionInterrupted = true;
+    clearTimeout(responseTimeoutTimer);
+    responseTimeoutTimer = null;
+    clearInterval(breakTimer);
+    breakTimer = null;
+    if (activeTrial) {
+        Object.assign(trialData, {
+            rt: null, response: null, timeout: false, accuracy: null,
+            TrialStatus: 'interrupted', CountedInK: 0, interruptionReason: reason
+        });
+        if (phase === 'trial_response') captureCursorData(trialData, false);
+        stimData.push({ ...trialData });
     }
+    hideVirtualCursor();
+    finishExperiment(reason);
+}
+
+document.addEventListener('pointerlockchange', () => {
+    const wasLocked = pointerLocked;
+    pointerLocked = document.pointerLockElement === canvas;
+    lastClientX = null;
+    lastClientY = null;
+    if (wasLocked && !pointerLocked) interruptSession('pointer_lock_lost');
 });
 
 document.addEventListener('fullscreenchange', () => {
-    if (!document.fullscreenElement && cursorActive &&
-        (experimentPhase === 'trial_response' || experimentPhase === 'practice_response')) {
-        hideVirtualCursor();
-        if (document.pointerLockElement === canvas && document.exitPointerLock) document.exitPointerLock();
-        alert('全屏已退出，当前试次已停止。请重新进入实验。');
-    }
+    if (!document.fullscreenElement) interruptSession('fullscreen_exit');
 });
 
 // ============================================================

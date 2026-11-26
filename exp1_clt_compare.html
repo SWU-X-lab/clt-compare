@@ -13,7 +13,7 @@
     <link rel="stylesheet" href="style.css">
     <!-- 页面版本号：与 exp1_clt_compare.js 的 EXP1_CLT_BUILD 保持一致，用于检测浏览器是否缓存了旧脚本 -->
     <script>
-        window.EXP1_CLT_PAGE_BUILD = '20261125compare-clean2';
+        window.EXP1_CLT_PAGE_BUILD = '20261126-data-integrity1';
         window.CLT_STORAGE_BACKEND = 'supabase';
     </script>
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -45,6 +45,8 @@
                            pattern="[012]" placeholder="0=调试；1=先做FCDT后CLT；2=先做CLT后FCDT" required>
                 </div>
                 <div class="form-group">
+                    <label for="participantCode">主试分配的匿名码（可选）</label>
+                    <input type="text" id="participantCode" maxlength="64" autocomplete="off" spellcheck="false" placeholder="不填写则自动生成；勿填姓名、手机号">
                     <label for="subjectID">匿名被试编号 (Subject ID)</label>
                     <input type="text" id="subjectID" readonly placeholder="开始实验后自动生成">
                 </div>
@@ -193,7 +195,7 @@
     <!-- 版本号用于强制刷新浏览器缓存，每次修改 exp1_clt_compare.js 后请同步递增 -->
     <script src="src/storage/supabase-storage.js"></script>
     <script src="src/storage/index.js"></script>
-    <script src="exp1_clt_compare.js?v=20261125compare-clean2"></script>
+    <script src="exp1_clt_compare.js?v=20261126-data-integrity1"></script>
 </body>
 
 </html>
