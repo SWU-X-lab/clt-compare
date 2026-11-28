@@ -5,8 +5,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const script = fs.readFileSync(path.join(__dirname, '..', 'exp1_clt_compare.js'), 'utf8');
-function app() {
+function app({ realExport = false, onSave = null, workbookError = null, autoDownloadError = null } = {}) {
     const calls = [];
+    const captured = { autoClicks: 0, workbooks: [] };
     const timers = new Map();
     const listeners = {};
     const elements = new Map();
@@ -14,7 +15,10 @@ function app() {
     const quiet = { log() {}, warn() {}, error() {} };
     const store = Object.fromEntries(['initializeStorage', 'saveTrial', 'saveCheckpoint', 'loadProgress',
         'saveProgress', 'saveFinalResult', 'clearProgress', 'finishExperiment'].map(name => [
-        name, async (...args) => { calls.push([name, ...args]); return null; }
+        name, async (...args) => {
+            calls.push([name, ...args]);
+            return name === 'saveFinalResult' && onSave ? onSave(...args) : null;
+        }
     ]));
     const node = id => {
         if (!elements.has(id)) elements.set(id, {
@@ -28,6 +32,10 @@ function app() {
     const document = {
         documentElement: {}, hidden: false, fullscreenElement: null, pointerLockElement: null,
         getElementById: node,
+        body: { appendChild() {} },
+        createElement() {
+            return { style: {}, remove() {}, click() { captured.autoClicks++; if (autoDownloadError) throw autoDownloadError; } };
+        },
         addEventListener(type, fn) { listeners['document:' + type] = fn; },
         exitPointerLock() { document.pointerLockElement = null; },
         exitFullscreen: async () => { document.fullscreenElement = null; }
@@ -51,6 +59,20 @@ function app() {
             }
         },
         history: { pushState() {} },
+        Blob,
+        URL: { createObjectURL: () => 'blob:local-first' },
+        XLSX: {
+            utils: {
+                json_to_sheet: (rows, options) => ({ rows, options }),
+                book_new: () => ({ SheetNames: [], Sheets: {} }),
+                book_append_sheet: (wb, sheet, name) => { wb.SheetNames.push(name); wb.Sheets[name] = sheet; }
+            },
+            write(wb) {
+                if (workbookError) throw workbookError;
+                captured.workbooks.push(wb);
+                return Uint8Array.from([0x50, 0x4b, 1, 2]);
+            }
+        },
         console: quiet,
         performance: { now: () => 1000 },
         setTimeout(fn, ms) { timers.set(nextTimer, [fn, ms]); return nextTimer++; },
@@ -62,8 +84,8 @@ function app() {
     const context = vm.createContext(g);
     const run = code => vm.runInContext(code, context);
     run(script);
-    run('downloadXLSX = () => { window.localDownloads = (window.localDownloads || 0) + 1; };');
-    return { calls, listeners, node, document, canvas, timers, run, g };
+    if (!realExport) run('downloadXLSX = () => { window.localDownloads = (window.localDownloads || 0) + 1; };');
+    return { calls, listeners, node, document, canvas, timers, run, g, captured };
 }
 const row = a => JSON.parse(JSON.stringify(a));
 const start = async (a, group, code) => {
@@ -167,4 +189,61 @@ test('Supabase 基础列回退明确标记部分保存，不访问线上服务',
     assert.match(result.message, /本地 Excel/);
     assert.equal(pending[0][0].cursorTravelPx, 10);
     assert.equal(pending[1][0].cursorTravelPx, undefined);
+});
+
+test('正式组：未完成的云端保存不阻塞本地工作簿、上传页下载链接和单次自动下载', async () => {
+    let settle;
+    const a = app({ realExport: true, onSave: () => new Promise(resolve => { settle = resolve; }) });
+    await start(a, '1', 'Stable-42');
+    probe(a);
+    a.run('recordResponse(null);');
+    const done = a.run('finishExperiment()');
+    assert.equal(a.captured.workbooks.length, 1);
+    assert.equal(a.captured.autoClicks, 1);
+    const xlsx = a.captured.workbooks[0].Sheets['Trial Data'].rows[0];
+    assert.equal(xlsx.SubjectID, 'Stable-42');
+    assert.equal(xlsx.TrialGlobal, 21);
+    assert.equal(xlsx.TrialStatus, 'timeout');
+    assert.equal(a.node('upload-manual-download-link').href, 'blob:local-first');
+    assert.equal(a.node('manual-download-link').href, 'blob:local-first');
+    assert.equal(a.document.pointerLockElement, null);
+    assert.match(a.node('upload-local-status').innerText, /本地 Excel：已生成/);
+    assert.match(a.node('upload-status').innerText, /云端：正在上传/);
+    assert.equal(a.node('finished-text').innerText, undefined);
+    assert.equal(a.calls.find(([name]) => name === 'saveFinalResult')[1].trials[0].TrialGlobal, 21);
+    settle({ partial: true, message: '服务器仅保存基础字段' });
+    await done;
+    assert.match(a.node('finished-text').innerText, /本地 Excel：已生成[\s\S]*云端：服务器仅保存基础字段/);
+    assert.equal(a.captured.autoClicks, 1);
+});
+
+test('正式组：云端失败时本地链接保留，自动下载异常不损坏手动链接', async () => {
+    const a = app({
+        realExport: true,
+        autoDownloadError: new Error('自动下载被浏览器阻止'),
+        onSave: async () => { throw Error('连接断开'); }
+    });
+    await start(a, '2', 'Stable-42');
+    probe(a);
+    a.run('recordResponse(null);');
+    await a.run('finishExperiment()');
+    assert.equal(a.captured.workbooks.length, 1);
+    assert.equal(a.node('upload-manual-download-link').href, 'blob:local-first');
+    assert.match(a.node('finished-text').innerText, /本地 Excel：已生成[\s\S]*云端：保存失败（连接断开）/);
+});
+
+test('正式组：未选本地导出或工作簿失败时仍保存云端且无虚假下载入口', async () => {
+    for (const workbookError of [null, new Error('示例导出失败')]) {
+        const a = app({ realExport: true, workbookError, onSave: async () => ({ message: '数据上传服务器成功。' }) });
+        await start(a, '1', 'Stable-42');
+        if (!workbookError) a.run('p.saveLocal = false;');
+        probe(a);
+        a.run('recordResponse(null);');
+        await a.run('finishExperiment()');
+        assert.equal(a.captured.workbooks.length, 0);
+        assert.equal(a.captured.autoClicks, 0);
+        assert.equal(a.node('upload-manual-download-link').href, undefined);
+        assert.match(a.node('finished-text').innerText,
+            workbookError ? /本地 Excel：生成失败[\s\S]*云端：数据上传服务器成功/ : /本地 Excel：未选择导出[\s\S]*云端：数据上传服务器成功/);
+    }
 });

@@ -75,7 +75,7 @@ const SESSION_ID = (globalThis.crypto && typeof globalThis.crypto.randomUUID ===
 
 // 运行版本标记（与 exp1_clt.html 中 exp1_clt.js?v= 保持一致）：
 // 用于确认浏览器实际加载的是最新代码，而非缓存里的旧版本
-const EXP1_CLT_BUILD = '20261126-data-integrity1';
+const EXP1_CLT_BUILD = '20261128-localfirst1';
 console.log('[exp1_clt] build ' + EXP1_CLT_BUILD + ' loaded');
 
 // 页面版本核对：与 html 的 PAGE_BUILD 不一致时告警
@@ -1262,14 +1262,45 @@ async function finishExperiment(interruptionReason = '') {
     switchScreen('upload');
     experimentPhase = 'upload';
 
-    let uploadMsg = interruptionReason ? "实验因浏览器中断而提前结束，请联系主试。 " : "";
-    let uploadFailed = Boolean(interruptionReason);
+    const localStatusEl = document.getElementById('upload-local-status');
+    const cloudStatusEl = document.getElementById('upload-status');
+    const sessionStatus = interruptionReason ? '实验因浏览器中断而提前结束，请联系主试。' : '';
+    const hasTrials = stimData.length > 0;
+    let localStatus = hasTrials ? '本地 Excel：未选择导出。' : '本地 Excel：暂无试次可导出。';
+    let cloudStatus = p.debugMode ? '云端：调试模式不上传。'
+        : !hasTrials ? '云端：暂无试次可上传。'
+        : storageReady ? '云端：正在上传，请勿关闭页面。'
+        : '云端：存储不可用，未上传。';
 
     enrichRows(stimData);
     lowAccDetail = computeLowAccuracyFlag();
     ss4LowAccuracyFlag = lowAccDetail.triggered;
 
-    if (storageReady && stimData.length > 0) {
+    // 先生成工作簿和手动下载链接，不等网络；下载状态不代表云端状态。
+    if (p.saveLocal && hasTrials) {
+        try {
+            downloadXLSX();
+            localStatus = '本地 Excel：已生成。如未自动下载，请点击下方链接。';
+        } catch (error) {
+            console.error('[exp1_clt] 本地导出失败:', error);
+            localStatus = '本地 Excel：生成失败（' + error.message + '）。';
+        }
+    }
+    localStatusEl.innerText = localStatus;
+    cloudStatusEl.innerText = cloudStatus;
+
+    // 即使网络仍在等待，也能点击上传页上的手动下载链接。
+    try {
+        if (document.pointerLockElement === canvas && document.exitPointerLock) document.exitPointerLock();
+        if (document.exitFullscreen && document.fullscreenElement) {
+            const exit = document.exitFullscreen();
+            if (exit && typeof exit.catch === 'function') exit.catch(() => {});
+        }
+    } catch (error) {
+        console.warn('[exp1_clt] 无法退出全屏:', error);
+    }
+
+    if (!p.debugMode && storageReady && hasTrials) {
         try {
             const saveResult = await storage.saveFinalResult({
                 trials: stimData,
@@ -1277,61 +1308,47 @@ async function finishExperiment(interruptionReason = '') {
                 lowAccuracyFlag: ss4LowAccuracyFlag,
                 lowAccuracyBlockCount: lowAccBlockCount
             });
-            uploadMsg += saveResult && saveResult.message ? saveResult.message : '数据保存成功。';
-            if (saveResult && saveResult.partial) uploadFailed = true;
-            // 异常退出不清除已完成组的断点；正常结束先清理、再结束后端会话。
-            if (!interruptionReason) await storage.clearProgress();
-            await storage.finishExperiment({ successful: !interruptionReason, message: interruptionReason || 'CLT mouse completed' });
+            cloudStatus = '云端：' + (saveResult && saveResult.message
+                ? saveResult.message : '保存请求已返回。');
+            cloudStatusEl.innerText = cloudStatus;
         } catch (error) {
             console.error('[CLT storage] final save failed:', error);
-            uploadFailed = true;
-            uploadMsg += '服务器上传失败: ' + error.message + '。';
+            cloudStatus = '云端：保存失败（' + error.message + '）。';
+            cloudStatusEl.innerText = cloudStatus;
             try {
                 await storage.finishExperiment({ successful: false, message: 'CLT mouse persistence failed' });
             } catch (finishError) {
                 console.error('[CLT storage] failed to close unsuccessful study:', finishError);
             }
+            cloudStatusEl.innerText = cloudStatus;
+            showFinished();
+            return;
         }
-    } else if (p.debugMode) {
-        uploadMsg += "调试模式仅保存本地 Excel，不上传。";
-    } else if (!storageReady) {
-        uploadFailed = true;
-        uploadMsg += "服务器存储不可用，仅保存本地 Excel。";
-    }
 
-    if (p.saveLocal && stimData.length > 0) {
         try {
-            downloadXLSX();
-            uploadMsg += "本地 Excel 已生成下载。";
-        } catch (e) {
-            console.error('[exp1_clt] 本地导出失败:', e);
-            uploadFailed = true;
-            uploadMsg += "本地 Excel 导出失败：" + e.message + "。";
+            // 异常退出不清除已完成组的断点；正常结束先清理、再结束后端会话。
+            if (!interruptionReason) await storage.clearProgress();
+            await storage.finishExperiment({ successful: !interruptionReason, message: interruptionReason || 'CLT mouse completed' });
+        } catch (error) {
+            console.error('[CLT storage] session finish failed:', error);
+            cloudStatus += ' 会话结束失败（' + error.message + '）。';
         }
     }
 
-    document.getElementById('upload-status').innerText = uploadMsg;
+    cloudStatusEl.innerText = cloudStatus;
+    showFinished();
 
-    // 结束语画面保持干净：仅在异常时显示状态说明
-    const statusEl = document.getElementById('finished-text');
-    if (statusEl) {
-        if (uploadFailed || p.debugMode) {
-            statusEl.innerText = uploadMsg;
+    function showFinished() {
+        const statusEl = document.getElementById('finished-text');
+        if (statusEl) {
+            statusEl.innerText = [sessionStatus, localStatus, cloudStatus].filter(Boolean).join('\n');
             statusEl.classList.remove('hidden');
-        } else {
-            statusEl.innerText = '';
-            statusEl.classList.add('hidden');
         }
+        setTimeout(() => {
+            switchScreen('finished');
+            experimentPhase = 'finished';
+        }, 2000);
     }
-
-    setTimeout(() => { switchScreen('finished'); }, 2000);
-
-    try {
-        if (document.pointerLockElement === canvas && document.exitPointerLock) document.exitPointerLock();
-        if (document.exitFullscreen && document.fullscreenElement) {
-            document.exitFullscreen().catch(() => {});
-        }
-    } catch (e) {}
 }
 
 // ============================================================
@@ -1735,30 +1752,40 @@ function saveWorkbookFile(wb, fileName) {
     const url = URL.createObjectURL(blob);
     lastExport = { url: url, fileName: fileName, size: u8.length };
 
+    // 先备好手动链接；自动下载被浏览器限制时，手动链接仍可使用。
+    showManualDownload(fileName, url);
+
     const a = document.createElement('a');
     a.href = url;
     a.download = fileName;
     a.rel = 'noopener';
     a.style.display = 'none';
     document.body.appendChild(a);
-    a.click();
-    a.remove();
+    try {
+        a.click();
+    } catch (error) {
+        console.warn('[exp1_clt] 自动下载未启动，请使用手动下载链接:', error);
+    } finally {
+        a.remove();
+    }
 
     console.log(`[exp1_clt] 已导出 ${fileName}（${u8.length} 字节，${wb.SheetNames.length} 个 sheet）`);
-    showManualDownload(fileName, url);
 }
 
-// 结束界面上的手动下载入口（文件名与自动下载一致）
+// 两个界面共用同一 Blob URL，不重复生成工作簿或自动下载。
 function showManualDownload(fileName, url) {
-    const box = document.getElementById('manual-download');
-    if (!box) return;
-    const link = document.getElementById('manual-download-link');
-    if (link) {
+    for (const [boxId, linkId] of [
+        ['upload-manual-download', 'upload-manual-download-link'],
+        ['manual-download', 'manual-download-link']
+    ]) {
+        const box = document.getElementById(boxId);
+        const link = document.getElementById(linkId);
+        if (!box || !link) continue;
         link.href = url;
         link.download = fileName;
         link.innerText = fileName;
+        box.classList.remove('hidden');
     }
-    box.classList.remove('hidden');
 }
 
 // ============================================================
