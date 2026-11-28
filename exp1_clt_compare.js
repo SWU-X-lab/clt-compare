@@ -75,7 +75,7 @@ const SESSION_ID = (globalThis.crypto && typeof globalThis.crypto.randomUUID ===
 
 // 运行版本标记（与 exp1_clt.html 中 exp1_clt.js?v= 保持一致）：
 // 用于确认浏览器实际加载的是最新代码，而非缓存里的旧版本
-const EXP1_CLT_BUILD = '20261128-localfirst1';
+const EXP1_CLT_BUILD = '20261128-localfirst2';
 console.log('[exp1_clt] build ' + EXP1_CLT_BUILD + ' loaded');
 
 // 页面版本核对：与 html 的 PAGE_BUILD 不一致时告警
@@ -485,6 +485,9 @@ window.addEventListener('keydown', (e) => {
         return;
     }
     if (inFormField) return;                               // 表单输入：放行所有普通按键
+    // 仅在保存阶段放行下载链接的 Enter，保留作答阶段的防误触规则。
+    if (e.key === 'Enter' && (experimentPhase === 'upload' || experimentPhase === 'finished') &&
+        (e.target?.id === 'upload-manual-download-link' || e.target?.id === 'manual-download-link')) return;
     if (e.key === 'Escape') {                              // 屏蔽 Esc 退出全屏
         e.preventDefault();
         return;

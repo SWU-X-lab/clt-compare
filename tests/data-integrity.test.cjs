@@ -59,6 +59,7 @@ function app({ realExport = false, onSave = null, workbookError = null, autoDown
             }
         },
         history: { pushState() {} },
+        HTMLInputElement: class {}, HTMLTextAreaElement: class {}, HTMLSelectElement: class {},
         Blob,
         URL: { createObjectURL: () => 'blob:local-first' },
         XLSX: {
@@ -206,6 +207,16 @@ test('正式组：未完成的云端保存不阻塞本地工作簿、上传页�
     assert.equal(xlsx.TrialStatus, 'timeout');
     assert.equal(a.node('upload-manual-download-link').href, 'blob:local-first');
     assert.equal(a.node('manual-download-link').href, 'blob:local-first');
+    for (const [id, key, prevented] of [
+        ['upload-manual-download-link', 'Enter', false],
+        ['manual-download-link', 'Enter', false],
+        ['upload-manual-download-link', 'Tab', false],
+        ['other-link', 'Enter', true]
+    ]) {
+        let blocked = false;
+        a.listeners['window:keydown']({target: {id}, key, preventDefault() { blocked = true; }});
+        assert.equal(blocked, prevented);
+    }
     assert.equal(a.document.pointerLockElement, null);
     assert.match(a.node('upload-local-status').innerText, /本地 Excel：已生成/);
     assert.match(a.node('upload-status').innerText, /云端：正在上传/);
