@@ -43,7 +43,7 @@
                 console.error('[CLT storage] Supabase full-row insert failed; retrying base columns:', error);
                 const { error: retryError } = await client.from('vwm_data').insert(rows.map(stripToBaseColumns));
                 if (retryError) throw retryError;
-                return { message: '数据上传服务器成功（按基础字段）。' };
+                return { partial: true, message: '服务器仅保存基础字段（不含完整鼠标轨迹或中断原因）；请以本地 Excel 为准。' };
             },
             finishExperiment() { return Promise.resolve({ message: '' }); }
         };
